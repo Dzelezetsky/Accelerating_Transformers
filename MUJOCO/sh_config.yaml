@@ -1,0 +1,27 @@
+model_config:
+  num_layers : 1   
+  d_model : 256   
+  n_heads : 2   
+  dim_feedforward : 512   
+  conv_lat_dim : 120
+  norm_first : False
+  init : False   
+  dropout : 0.05 
+  wo_ffn : False        # True | False
+  use_gate : False     # True
+  gate_mode : 'GRU'     # No | GRU | Input | Output | Highway | ST
+  separate : True       
+  critic_mode : 'FC'    # FC | Trans | Mamba | LSTM
+  actor_mode : 'Trans'  # Trans | Diff-Trans | Mamba | FC
+  algo : 'TD3'        # TD3 for now
+
+
+
+train_config : 
+  algo : 'TD3' # TD3, SAC        #                  
+  context_length : 3          #
+  replay_buffer_size : 500000  #1000000
+  batch_size : 500
+
+
+
