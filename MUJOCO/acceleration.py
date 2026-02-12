@@ -8,7 +8,7 @@ import yaml
 import copy
 
 ##########################################
-from tools4acceleration import TD3, New_Trans_RB, env_constructor, ReplayBuffer
+from tools4acceleration import TD3, env_constructor, ReplayBuffer
 ##########################################
 
 
@@ -147,13 +147,13 @@ if __name__ == "__main__":
     parser.add_argument("--obs_indices", default=None) #Cth [0,1,2,3,8,9,10,11,12] | Hppr [0,1,2,3,4] | Ant [0,1,2,3,4,5,6,7,8,9,10,11,12]
     parser.add_argument("--obs_mode", default="state")
     parser.add_argument("--use_train_data", default=False)
-    parser.add_argument("--additional_ascent", default=False)
     parser.add_argument("--evals_for_trans", default=10)
     parser.add_argument("--num_envs", default=1, type=int)
     parser.add_argument("--seed", default=1, type=int)
     parser.add_argument("--trans_critic", default=False)
     parser.add_argument("--separate_trans_critic", default=False)
-    parser.add_argument("--additional_bellman", default=False)
+    parser.add_argument("--additional_ascent", default=True)
+    parser.add_argument("--additional_bellman", default=True)
     parser.add_argument("--start_timesteps", default=25e3, type=int)# Time steps initial random policy is used
     parser.add_argument("--eval_freq", default=3e3, type=int)       # 2e3
     parser.add_argument("--max_timesteps", default=500000, type=int)   # Max time steps to run environment
@@ -183,7 +183,7 @@ if __name__ == "__main__":
         args.seed = RUN
         
         
-        path2run = f"WORKSHOP_RUNS/{args.env}/[acceleration]|seed={args.seed}|AddAsc={args.additional_ascent}|UseTrData={args.use_train_data}|"
+        path2run = f"runs/first_debug/{args.env}/acceleration/|seed={args.seed}|AddAsc={args.additional_ascent}|UseTrData={args.use_train_data}|"
 
         experiment = SummaryWriter(log_dir=path2run)
         
@@ -288,6 +288,7 @@ if __name__ == "__main__":
                 experiment.add_scalar('Eval_reward', avg_reward, t)
                 
                 policy.train_trans_actor(256, args.additional_ascent)
+                policy.train_trans_critic(256, args.additional_bellman)
                 #policy.trans_RB.reset()
                 tr_avg_reward = eval_transformer(policy, args, 1)
                 experiment.add_scalar('Trans_Eval_reward_1', tr_avg_reward, t)

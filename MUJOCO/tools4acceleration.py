@@ -7,7 +7,7 @@ import sys
 import os
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-from Model.transformer import Model
+
 from gymnasium import spaces
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -180,6 +180,217 @@ class Critic(nn.Module):
         q1 = F.relu(self.l2_2(q1))
         q1 = self.l3(q1)
         return q1
+    
+
+############################################################################################################################
+# Transformer actor+critic for acceleration (TD3-style)
+############################################################################################################################
+
+class SinusoidalPositionalEncoding(nn.Module):
+    """
+    Adds fixed sinusoidal positional encoding to a (B, T, D) tensor.
+    Cached per (device, dtype, T, D).
+    """
+    def __init__(self, d_model: int):
+        super().__init__()
+        self.d_model = int(d_model)
+        self.register_buffer("_pe", torch.empty(0), persistent=False)
+
+    def _build(self, T: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        position = torch.arange(T, device=device, dtype=dtype).unsqueeze(1)  # (T, 1)
+        div_term = torch.exp(
+            torch.arange(0, self.d_model, 2, device=device, dtype=dtype)
+            * (-np.log(10000.0) / self.d_model)
+        )  # (D/2,)
+        pe = torch.zeros(T, self.d_model, device=device, dtype=dtype)
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        return pe.unsqueeze(0)  # (1, T, D)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, T, D)
+        T = int(x.size(1))
+        if (
+            self._pe.numel() == 0
+            or self._pe.size(1) < T
+            or self._pe.size(2) != self.d_model
+            or self._pe.device != x.device
+            or self._pe.dtype != x.dtype
+        ):
+            self._pe = self._build(T, x.device, x.dtype)
+        return x + self._pe[:, :T, :]
+
+
+class TransformerModel(nn.Module):
+    """
+    Minimal Transformer encoder model with:
+      - actor_forward(states, img_states=None) -> actions
+      - critic_forward(states, actions, img_states=None) -> (Q1, Q2)
+      - Q1(states, actions, img_states=None) -> Q1
+
+    Shapes expected by your code:
+      states: (n_e, bs, context, state_dim)
+      actions: (n_e, bs, act_dim)
+      img_states (optional): (n_e, bs, context, H, W, C) with NHWC layout
+    """
+    def __init__(
+        self,
+        state_dim: int,
+        act_dim: int,
+        obs_mode: str = "state",
+        max_action: float = 1.0,
+        # Common config keys (extra keys are ignored via **kwargs):
+        d_model = None,
+        nhead = None,
+        num_layers = None,
+        dropout = None,
+        dim_feedforward = None,
+        conv_lat_dim = 64,
+        critic_hidden = 256,
+        critic_mode = "shared",
+        **kwargs,
+    ):
+        super().__init__()
+
+        # Backward/legacy config aliases
+        d_model = d_model or kwargs.get("embed_dim") or kwargs.get("n_embd") or kwargs.get("hidden_dim") or 128
+        nhead = nhead or kwargs.get("n_head") or kwargs.get("n_heads") or 4
+        num_layers = num_layers or kwargs.get("n_layer") or kwargs.get("n_layers") or kwargs.get("depth") or 4
+        dropout = float(dropout if dropout is not None else kwargs.get("dropout", 0.1))
+        dim_feedforward = dim_feedforward or kwargs.get("ff_dim") or (4 * int(d_model))
+
+        self.state_dim = int(state_dim)
+        self.act_dim = int(act_dim)
+        self.obs_mode = str(obs_mode)
+        self.max_action = float(max_action)
+        self.critic_mode = str(critic_mode)
+
+        self.use_img = self.obs_mode != "state"
+        self.conv_lat_dim = int(conv_lat_dim)
+
+        if self.use_img:
+            input_channels = 3 if self.obs_mode == "rgb" else 4
+            self.img_encoder = nn.Sequential(
+                nn.Conv2d(input_channels, 16, 3, padding=1, bias=True), nn.ReLU(inplace=True),
+                nn.MaxPool2d(4, 4),
+                nn.Conv2d(16, 32, 3, padding=1, bias=True), nn.ReLU(inplace=True),
+                nn.MaxPool2d(2, 2),
+                nn.Conv2d(32, 64, 3, padding=1, bias=True), nn.ReLU(inplace=True),
+                nn.MaxPool2d(2, 2),
+                nn.Conv2d(64, 64, 3, padding=1, bias=True), nn.ReLU(inplace=True),
+                nn.MaxPool2d(2, 2),
+                nn.Conv2d(64, 64, 1, padding=0, bias=True), nn.ReLU(inplace=True),
+                nn.Flatten(1),
+                nn.Linear(1024, self.conv_lat_dim),
+            )
+            in_dim = self.state_dim + self.conv_lat_dim
+        else:
+            self.img_encoder = None
+            in_dim = self.state_dim
+
+        self.in_proj = nn.Linear(in_dim, int(d_model))
+        self.pos_enc = SinusoidalPositionalEncoding(int(d_model))
+        self.ln_in = nn.LayerNorm(int(d_model))
+
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=int(d_model),
+            nhead=int(nhead),
+            dim_feedforward=int(dim_feedforward),
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=int(num_layers))
+
+        self._mask_cache_T = -1
+        self._mask_cache = None
+
+        self.actor_head = nn.Sequential(
+            nn.Linear(int(d_model), int(d_model)),
+            nn.ReLU(inplace=True),
+            nn.Linear(int(d_model), self.act_dim),
+        )
+
+        q_in = int(d_model) + self.act_dim
+        self.q1 = nn.Sequential(
+            nn.Linear(q_in, critic_hidden), nn.ReLU(inplace=True),
+            nn.Linear(critic_hidden, critic_hidden), nn.ReLU(inplace=True),
+            nn.Linear(critic_hidden, 1),
+        )
+        self.q2 = nn.Sequential(
+            nn.Linear(q_in, critic_hidden), nn.ReLU(inplace=True),
+            nn.Linear(critic_hidden, critic_hidden), nn.ReLU(inplace=True),
+            nn.Linear(critic_hidden, 1),
+        )
+
+    def _causal_mask(self, T: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        # nn.Transformer expects float mask with -inf in masked positions
+        if self._mask_cache is None or self._mask_cache_T != T or self._mask_cache.device != device or self._mask_cache.dtype != dtype:
+            self._mask_cache_T = int(T)
+            self._mask_cache = torch.triu(
+                torch.full((T, T), float("-inf"), device=device, dtype=dtype),
+                diagonal=1,
+            )
+        return self._mask_cache
+
+    def _flatten_states(self, x: torch.Tensor):
+        if x.dim() == 4:
+            n_e, bs, T, D = x.shape
+            return x.reshape(n_e * bs, T, D), int(n_e), int(bs)
+        if x.dim() == 3:
+            B, T, D = x.shape
+            return x, 1, int(B)
+        raise ValueError(f"Expected states dim 3 or 4, got shape={tuple(x.shape)}")
+
+    def _encode(self, states: torch.Tensor, img_states: torch.Tensor = None) -> torch.Tensor:
+        x, n_e, bs = self._flatten_states(states)  # (B, T, state_dim)
+        B, T, _ = x.shape
+
+        if self.use_img:
+            if img_states is None:
+                img_feat = torch.zeros((B, T, self.conv_lat_dim), device=x.device, dtype=x.dtype)
+            else:
+                if img_states.dim() != 6:
+                    raise ValueError(f"Expected img_states dim 6 (n_e, bs, T, H, W, C), got shape={tuple(img_states.shape)}")
+                n_e2, bs2, T2, H, W, C = img_states.shape
+                img_bt = img_states.reshape(n_e2 * bs2 * T2, H, W, C).permute(0, 3, 1, 2).contiguous()
+                img_emb = self.img_encoder(img_bt)  # (B*T, conv_lat_dim)
+                img_feat = img_emb.reshape(n_e2 * bs2, T2, self.conv_lat_dim)
+
+            x = torch.cat([x, img_feat], dim=-1)
+
+        x = self.in_proj(x)
+        x = self.pos_enc(x)
+        x = self.ln_in(x)
+
+        mask = self._causal_mask(T, x.device, x.dtype)
+        h = self.encoder(x, mask=mask)  # (B, T, d_model)
+        return h.reshape(n_e, bs, T, h.size(-1))
+
+    def actor_forward(self, states: torch.Tensor, img_states = None) -> torch.Tensor:
+        h = self._encode(states, img_states)  # (n_e, bs, T, d_model)
+        last = h[:, :, -1, :]                # (n_e, bs, d_model)
+        a = self.actor_head(last)
+        return self.max_action * torch.tanh(a)
+
+    def critic_forward(
+        self,
+        states: torch.Tensor,
+        actions: torch.Tensor,
+        img_states = None,
+    ):
+        h = self._encode(states, img_states)  # (n_e, bs, T, d_model)
+        last = h[:, :, -1, :]                 # (n_e, bs, d_model)
+        sa = torch.cat([last, actions], dim=-1)
+        return self.q1(sa), self.q2(sa)
+
+    def Q1(self, states: torch.Tensor, actions: torch.Tensor, img_states = None) -> torch.Tensor:
+        h = self._encode(states, img_states)
+        last = h[:, :, -1, :]
+        sa = torch.cat([last, actions], dim=-1)
+        return self.q1(sa)
+
 
 
 class TD3(object):
@@ -212,7 +423,14 @@ class TD3(object):
         
         
 
-        self.trans = Model(**model_config, state_dim=state_dim, act_dim=action_dim, obs_mode=obs_mode).to(device)
+        self.trans = TransformerModel(
+            state_dim=state_dim,
+            act_dim=action_dim,
+            obs_mode=obs_mode,
+            max_action=max_action,
+            **model_config,
+        ).to(device)
+
         self.trans_target = copy.deepcopy(self.trans).to(device)
         self.trans_optimizer = torch.optim.Adam(self.trans.parameters(), lr=3e-4)
         self.trans_RB = Trans_RB(num_envs, 30000, context_length, state_dim, action_dim) 
