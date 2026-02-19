@@ -4,7 +4,7 @@ import torch
 import argparse
 import os
 import yaml
-
+from datetime import datetime
 import copy
 
 ##########################################
@@ -146,14 +146,17 @@ if __name__ == "__main__":
     parser.add_argument("--env", default="Hopper-v4")          # OpenAI gym environment name
     parser.add_argument("--obs_indices", default=None) #Cth [0,1,2,3,8,9,10,11,12] | Hppr [0,1,2,3,4] | Ant [0,1,2,3,4,5,6,7,8,9,10,11,12]
     parser.add_argument("--obs_mode", default="state")
-    parser.add_argument("--use_train_data", default=False)
-    parser.add_argument("--evals_for_trans", default=10)
+    parser.add_argument("--evals_for_trans", default=150)
     parser.add_argument("--num_envs", default=1, type=int)
     parser.add_argument("--seed", default=1, type=int)
-    parser.add_argument("--trans_critic", default=False)
-    parser.add_argument("--separate_trans_critic", default=False)
-    parser.add_argument("--additional_ascent", default=True)
-    parser.add_argument("--additional_bellman", default=True)
+    ########################################################
+    parser.add_argument("--use_train_data", default=False)
+
+    parser.add_argument("--actor_mse", default=True)
+    parser.add_argument("--actor_ascent", default=True)
+    parser.add_argument("--critic_mse", default=False)
+    parser.add_argument("--critic_bellman", default=True)
+    ########################################################
     parser.add_argument("--start_timesteps", default=25e3, type=int)# Time steps initial random policy is used
     parser.add_argument("--eval_freq", default=3e3, type=int)       # 2e3
     parser.add_argument("--max_timesteps", default=500000, type=int)   # Max time steps to run environment
@@ -182,8 +185,8 @@ if __name__ == "__main__":
         
         args.seed = RUN
         
-        
-        path2run = f"runs/first_debug/{args.env}/acceleration/|seed={args.seed}|AddAsc={args.additional_ascent}|UseTrData={args.use_train_data}|"
+        ts = datetime.now().strftime("%H%M%S")
+        path2run = f"runs/first_debug/{args.env}/acceleration/|seed={args.seed}|ActMSE={args.actor_mse},ActAsc={args.actor_ascent}|CritMSE={args.critic_mse},CritBellman={args.critic_bellman}|UseTrData={args.use_train_data}|{ts}"
 
         experiment = SummaryWriter(log_dir=path2run)
         
@@ -271,6 +274,8 @@ if __name__ == "__main__":
                 policy.train(replay_buffer, args.batch_size)
                 if args.use_train_data:
                     policy.train_trans_actor(256, args.additional_ascent)
+                    policy.train_trans_critic(256, args.additional_bellman)
+                    policy.trans_RB.reset()
             if done: 
                 avg_ret = avg_ret / args.num_envs
                 print(f"Total T: {t+1} Episode Num: {episode_num+1} | Reward: {avg_ret}")
@@ -287,17 +292,17 @@ if __name__ == "__main__":
                 avg_reward = eval_policy(policy, args, args.evals_for_trans)
                 experiment.add_scalar('Eval_reward', avg_reward, t)
                 
-                policy.train_trans_actor(256, args.additional_ascent)
-                policy.train_trans_critic(256, args.additional_bellman)
+                policy.train_trans_actor(256, args.actor_mse, args.actor_ascent)
+                policy.train_trans_critic(256, args.critic_mse, args.critic_bellman)
                 #policy.trans_RB.reset()
                 tr_avg_reward = eval_transformer(policy, args, 1)
                 experiment.add_scalar('Trans_Eval_reward_1', tr_avg_reward, t)
                 
-                if (tr_avg_reward > max_trans_reward) and (tr_avg_reward > 1000):
-                    max_trans_reward = tr_avg_reward
-                    torch.save(policy.trans, f"WORKSHOP_WEIGHTS/{args.env}/[accelerated]Trans|seed={args.seed}|AddAsc={args.additional_ascent}|UseTrData={args.use_train_data}|.pth")
-                    torch.save(policy.trans_target, f"WORKSHOP_WEIGHTS/{args.env}/[accelerated]Trans(t)|seed={args.seed}|AddAsc={args.additional_ascent}|UseTrData={args.use_train_data}|.pth")
-                    torch.save(policy.critic, f"WORKSHOP_WEIGHTS/{args.env}/[accelerated]St_Critic|seed={args.seed}|AddAsc={args.additional_ascent}|UseTrData={args.use_train_data}|.pth")
-                    torch.save(policy.critic_target, f"WORKSHOP_WEIGHTS/{args.env}/[accelerated]St_Critic(t)|seed={args.seed}|AddAsc={args.additional_ascent}|UseTrData={args.use_train_data}|.pth") 
+                # if (tr_avg_reward > max_trans_reward) and (tr_avg_reward > 1000):
+                #     max_trans_reward = tr_avg_reward
+                #     torch.save(policy.trans, f"WORKSHOP_WEIGHTS/{args.env}/[accelerated]Trans|seed={args.seed}|AddAsc={args.additional_ascent}|UseTrData={args.use_train_data}|.pth")
+                #     torch.save(policy.trans_target, f"WORKSHOP_WEIGHTS/{args.env}/[accelerated]Trans(t)|seed={args.seed}|AddAsc={args.additional_ascent}|UseTrData={args.use_train_data}|.pth")
+                #     torch.save(policy.critic, f"WORKSHOP_WEIGHTS/{args.env}/[accelerated]St_Critic|seed={args.seed}|AddAsc={args.additional_ascent}|UseTrData={args.use_train_data}|.pth")
+                #     torch.save(policy.critic_target, f"WORKSHOP_WEIGHTS/{args.env}/[accelerated]St_Critic(t)|seed={args.seed}|AddAsc={args.additional_ascent}|UseTrData={args.use_train_data}|.pth") 
                 
          

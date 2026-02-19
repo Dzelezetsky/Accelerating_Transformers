@@ -432,8 +432,19 @@ class TD3(object):
         ).to(device)
 
         self.trans_target = copy.deepcopy(self.trans).to(device)
-        self.trans_optimizer = torch.optim.Adam(self.trans.parameters(), lr=3e-4)
-        self.trans_RB = Trans_RB(num_envs, 30000, context_length, state_dim, action_dim) 
+        
+        self.trans_actor_optimizer = torch.optim.Adam(self.trans.actor_head.parameters(), lr=3e-4)
+
+        self.trans_critic_optimizer = torch.optim.Adam(
+            list(self.trans.in_proj.parameters()) +
+            list(self.trans.ln_in.parameters()) +
+            list(self.trans.encoder.parameters()) +
+            list(self.trans.q1.parameters()) +
+            list(self.trans.q2.parameters()),
+            lr=3e-4
+        )
+
+        self.trans_RB = Trans_RB(num_envs, 150000, context_length, state_dim, action_dim) 
 
 
         self.max_action = max_action
@@ -619,96 +630,191 @@ class TD3(object):
 
         
         
-    def train_trans_actor(self, batch_size, additional_ascent):
+    def train_trans_actor(self, batch_size: int, actor_mse: bool, actor_ascent: bool):
         self.trans.train()
+
+        # нет данных
+        if (self.trans_RB.idx <= 0) and (not self.trans_RB.overfilled):
+            print('No data to train actor')
+            return
+
+        def _set_requires(module, flag: bool):
+            if module is None:
+                return
+            for p in module.parameters():
+                p.requires_grad_(flag)
+
+        # индексы доступных записей
         idxs = torch.randperm(self.trans_RB.idx)
         chunks = split_indices(idxs, batch_size)
+
         bc_losses = []
         ascent_losses = []
+
+        # ВАЖНО: в actor-тренировке держим encoder+critic замороженными
+        # (максимально похоже на TD3: critic фиксирован при policy update)
+        _set_requires(getattr(self.trans, "in_proj", None), False)
+        _set_requires(getattr(self.trans, "ln_in", None), False)
+        _set_requires(getattr(self.trans, "encoder", None), False)
+        _set_requires(getattr(self.trans, "q1", None), False)
+        _set_requires(getattr(self.trans, "q2", None), False)
+        _set_requires(getattr(self.trans, "img_encoder", None), False)
+        _set_requires(getattr(self.trans, "actor_head", None), True)
+
+        actor_params = list(self.trans.actor_head.parameters())
+
+        step_k = 0
         for chunk in chunks:
-            # BEHAVIOR CLONNING
+            if chunk.numel() == 0:
+                continue
+
             batch = self.trans_RB.sample(chunk)
-            states = batch[0]
-            targets = batch[2]
-            preds = self.trans.actor_forward(states)
-            loss = nn.MSELoss()(preds, targets)
-            self.trans_optimizer.zero_grad()
-            bc_losses.append(loss.item())
-            loss.backward()
-            self.trans_optimizer.step()
-            
-            # GRADIENT ASCENT
-            if additional_ascent:
-                trans_loss = -self.critic.Q1(states[:,:,-1,:], self.trans.actor_forward(states)).mean()
-                ascent_losses.append(trans_loss.cpu().detach().numpy())
-                self.trans_optimizer.zero_grad()
+            if batch is None or batch[0].size(1) == 0:
+                continue
+
+            states = batch[0]   # (n_e, bs, context, s_d)
+            targets = batch[2]  # (n_e, bs, a_d)
+
+            # # ----- BC -----
+            if actor_mse:
+                preds = self.trans.actor_forward(states)
+                bc_loss = F.mse_loss(preds, targets)
+
+                self.trans_actor_optimizer.zero_grad(set_to_none=True)
+                bc_loss.backward()
+                torch.nn.utils.clip_grad_value_(actor_params, self.grad_clip)
+                self.trans_actor_optimizer.step()
+
+                bc_losses.append(float(bc_loss.item()))
+
+            # ----- ascent (delayed, как TD3 policy_freq) -----
+            if actor_ascent: #and (step_k % self.policy_freq == 0):
+                actions_pi = self.trans.actor_forward(states)
+                trans_loss = -self.trans.Q1(states, actions_pi).mean()  # maximize Q1
+
+                self.trans_actor_optimizer.zero_grad(set_to_none=True)
                 trans_loss.backward()
-                self.trans_optimizer.step()
-                
-        self.trans_RB.reset()
-        self.experiment.add_scalar('Trans_BC_loss', np.mean(bc_losses), self.eval_counter)
-        if additional_ascent:
-            self.experiment.add_scalar('Trans_Online_loss', np.mean(ascent_losses), self.eval_counter)
-        self.eval_counter += 1	
-            
-        
+                torch.nn.utils.clip_grad_value_(actor_params, self.grad_clip)
+                self.trans_actor_optimizer.step()
+
+                ascent_losses.append(float(trans_loss.item()))
+
+            step_k += 1
+
+        # вернуть requires_grad обратно (на всякий случай для других частей кода)
+        _set_requires(getattr(self.trans, "in_proj", None), True)
+        _set_requires(getattr(self.trans, "ln_in", None), True)
+        _set_requires(getattr(self.trans, "encoder", None), True)
+        _set_requires(getattr(self.trans, "q1", None), True)
+        _set_requires(getattr(self.trans, "q2", None), True)
+        _set_requires(getattr(self.trans, "img_encoder", None), True)
+        _set_requires(getattr(self.trans, "actor_head", None), True)
+
+        # логирование
+        if actor_mse and len(bc_losses) > 0:
+            self.experiment.add_scalar("Trans_Actor_BC_loss", float(np.mean(bc_losses)), self.eval_counter)
+        if actor_ascent and len(ascent_losses) > 0:
+            self.experiment.add_scalar("Trans_Actor_Ascent_loss", float(np.mean(ascent_losses)), self.eval_counter)
+
+        # soft update target
         for param, target_param in zip(self.trans.parameters(), self.trans_target.parameters()):
             target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
-        self.actor_optimizer.zero_grad()
-        self.critic_optimizer.zero_grad()    
+
+        self.eval_counter += 1    
     
-    def train_trans_critic(self, batch_size, additional_bellman):
+    def train_trans_critic(self, batch_size: int, mse_critic: bool, bellman_critic: bool):
+        
         self.trans.train()
+
+        # нет данных
+        if (self.trans_RB.idx <= 0) and (not self.trans_RB.overfilled):
+            print('No data to train actor')
+            return
+
+        def _set_requires(module, flag: bool):
+            if module is None:
+                return
+            for p in module.parameters():
+                p.requires_grad_(flag)
+
+        # freeze actor_head so critic update doesn't move policy directly
+        _set_requires(getattr(self.trans, "actor_head", None), False)
+
+        # teacher: лучше critic_target (стабильнее), если есть
+        teacher = getattr(self, "critic_target", None)
+        if teacher is None:
+            teacher = self.critic
+
         idxs = torch.randperm(self.trans_RB.idx)
         chunks = split_indices(idxs, batch_size)
+
         bc_losses = []
         bellman_losses = []
+
+        # параметры критика для клипа (всё, кроме actor_head)
+        critic_params = []
+        for name in ["in_proj", "ln_in", "encoder", "q1", "q2", "img_encoder"]:
+            mod = getattr(self.trans, name, None)
+            if mod is not None:
+                critic_params += list(mod.parameters())
+
         for chunk in chunks:
-            # BEHAVIOR CLONNING
+            if chunk.numel() == 0:
+                continue
+
             batch = self.trans_RB.sample(chunk)
-            states = batch[0]       # n_e, b_s, cont, s_d
-            next_states = batch[1]
-            actions = batch[2]      # n_e, b_s, a_d
-            rewards = batch[3]      # n_e, b_s, 1
-            not_dones = batch[4]    # n_e, b_s, 1
-            target1, target2 = self.critic(states[:,:,-1,:], actions)
-            pred1, pred2 = self.trans.critic_forward(states, actions)  # pred1=pred2 = n_e, b_s, 1
-            loss = nn.MSELoss()(pred1, target1) + nn.MSELoss()(pred2, target2)
-            self.trans_optimizer.zero_grad()
-            bc_losses.append(loss.item())
-            loss.backward()
-            self.trans_optimizer.step()
-            
-            if additional_bellman:
+            if batch is None or batch[0].size(1) == 0:
+                continue
+
+            states = batch[0]       # (n_e, bs, context, s_d)
+            next_states = batch[1]  # (n_e, bs, context, s_d)
+            actions = batch[2]      # (n_e, bs, a_d)
+            rewards = batch[3]      # (n_e, bs, 1)
+            not_dones = batch[4]    # (n_e, bs, 1)
+
+            # ----- BC critic: trans critic -> teacher critic -----
+            if mse_critic:
                 with torch.no_grad():
-                    noise = (
-                        torch.randn_like(actions) * self.policy_noise        #noise = (n_e, b_s, a_d)
-                    ).clamp(-self.noise_clip, self.noise_clip)
-                    next_actions = (
-                        self.trans_target.actor_forward(next_states) + noise               #next_action = (n_e, b_s, a_d)
-                    ).clamp(-self.max_action, self.max_action)
-                    
-                    # Compute the target Q value
-                    target_Q1, target_Q2 = self.trans_target.critic_forward(next_states, next_actions)
-                    target_Q = torch.min(target_Q1, target_Q2)                          #target_Q = (n_e, b_s, 1)
-                    target_Q = rewards + not_dones * self.discount * target_Q             #target_Q = (n_e, b_s, 1) + (n_e, b_s, 1) * const * (n_e, b_s, 1)
-            
-                # Get current Q estimates
-                current_Q1, current_Q2 = self.trans.critic_forward(states, actions)                     #current_Q1(and Q2) = (n_e, b_s, 1)
+                    t1, t2 = teacher(states[:, :, -1, :], actions)
 
-                # Compute critic loss
-                critic_loss = F.mse_loss(current_Q1, target_Q) + F.mse_loss(current_Q2, target_Q) #
+                p1, p2 = self.trans.critic_forward(states, actions)
+                bc_loss = F.mse_loss(p1, t1) + F.mse_loss(p2, t2)
 
-                # Optimize the critic
-                self.trans_optimizer.zero_grad()
-                bellman_losses.append(loss.item())
-                critic_loss.backward()
-                self.trans_optimizer.step()
-                
-        
-        self.experiment.add_scalar('Trans_Critic_BC_loss', np.mean(bc_losses), self.eval_counter) 
-        if additional_bellman:
-            self.experiment.add_scalar('Trans_Critic_Bellman_loss', np.mean(bellman_losses), self.eval_counter) 
+                self.trans_critic_optimizer.zero_grad(set_to_none=True)
+                bc_loss.backward()
+                torch.nn.utils.clip_grad_value_(critic_params, self.grad_clip)
+                self.trans_critic_optimizer.step()
+
+                bc_losses.append(float(bc_loss.item()))
+
+            # ----- Bellman critic (TD3-style) -----
+            if bellman_critic:
+                with torch.no_grad():
+                    noise = (torch.randn_like(actions) * self.policy_noise).clamp(-self.noise_clip, self.noise_clip)
+                    next_actions = (self.trans_target.actor_forward(next_states) + noise).clamp(-self.max_action, self.max_action)
+
+                    tq1, tq2 = self.trans_target.critic_forward(next_states, next_actions)
+                    tq = torch.min(tq1, tq2)
+                    target_Q = rewards + not_dones * self.discount * tq  # (n_e, bs, 1)
+
+                c1, c2 = self.trans.critic_forward(states, actions)
+                bellman_loss = F.mse_loss(c1, target_Q) + F.mse_loss(c2, target_Q)
+
+                self.trans_critic_optimizer.zero_grad(set_to_none=True)
+                bellman_loss.backward()
+                torch.nn.utils.clip_grad_value_(critic_params, self.grad_clip)
+                self.trans_critic_optimizer.step()
+
+                bellman_losses.append(float(bellman_loss.item()))
+
+        # unfreeze actor_head back
+        _set_requires(getattr(self.trans, "actor_head", None), True)
+
+        if mse_critic and len(bc_losses) > 0:
+            self.experiment.add_scalar("Trans_Critic_BC_loss", float(np.mean(bc_losses)), self.eval_counter)
+        if bellman_critic and len(bellman_losses) > 0:
+            self.experiment.add_scalar("Trans_Critic_Bellman_loss", float(np.mean(bellman_losses)), self.eval_counter)
+ 
     
     
 ############################################################################################################################
@@ -792,6 +898,7 @@ class Trans_RB(object):
         if self.idx >= self.size:
             self.idx = 0
             self.overfilled = True
+            print('Overfilled!')
 
     def sample(self, idxs):
         
